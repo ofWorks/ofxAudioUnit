@@ -7,206 +7,215 @@
 
 #pragma mark Objective-C
 
-#if __has_feature(objc_arc)
-#   define OF_OBJC_DEALLOC(obj)
-#   define OF_OBJC_RELEASE(obj) obj
-#   define OF_OBJC_RETAIN(obj) obj
-#   define OF_OBJC_AUTORELEASE(obj) obj
-#else
-#   define OF_OBJC_DEALLOC(obj) [obj dealloc]
-#   define OF_OBJC_RELEASE(obj) [obj release]
-#   define OF_OBJC_RETAIN(obj) [obj retain]
-#   define OF_OBJC_AUTORELEASE(obj) [obj autorelease]
-#endif
+// Keep track of open windows to prevent premature release
+static NSMutableSet *gOpenWindows = nil;
 
-@interface ofxAudioUnitUIWindow : NSWindow
-{
-	__strong NSView * _AUView;
+static NSMutableSet* GetOpenWindows() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gOpenWindows = [[NSMutableSet alloc] init];
+    });
+    return gOpenWindows;
 }
 
-- (id) initWithAudioUnit:(AudioUnit)unit forceGeneric:(BOOL)useGeneric;
+@interface ofxAudioUnitUIWindow : NSWindow
+
+@property (nonatomic, strong) NSView *auView;
+
+- (instancetype)initWithAudioUnit:(AudioUnit)unit forceGeneric:(BOOL)useGeneric;
 
 @end
 
 @implementation ofxAudioUnitUIWindow
 
-// ----------------------------------------------------------
-- (void) dealloc
-// ----------------------------------------------------------
-{
-	[[NSNotificationCenter defaultCenter] removeObserver:self
-													name:NSViewFrameDidChangeNotification
-												  object:_AUView];
-	OF_OBJC_RELEASE(_AUView);
-	OF_OBJC_DEALLOC(super);
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:NSViewFrameDidChangeNotification
+                                                  object:self.auView];
+
+    // Remove from tracking set
+    [[GetOpenWindows() objectsPassingTest:^BOOL(id obj, BOOL *stop) {
+        return obj == self;
+    }] enumerateObjectsUsingBlock:^(id obj, BOOL *stop) {
+        [GetOpenWindows() removeObject:obj];
+    }];
+
+#if !__has_feature(objc_arc)
+    [_auView release];
+    [super dealloc];
+#endif
 }
 
-// ----------------------------------------------------------
-- (instancetype) initWithAudioUnit:(AudioUnit)unit forceGeneric:(BOOL)useGeneric
-// ----------------------------------------------------------
-{
-	if(useGeneric) {
-		return [self initWithGenericViewForUnit:unit];
-	} else if([ofxAudioUnitUIWindow audioUnitHasCocoaView:unit]) {
-		if(![self initWithCocoaViewForUnit:unit]) {
-			return nil;
-		}
-	} else if([ofxAudioUnitUIWindow audioUnitHasCarbonView:unit]) {
-		[self printUnsupportedCarbonMessage:unit];
-	} else {
-		return [self initWithGenericViewForUnit:unit];
-	}
-	
-	return self;
+- (instancetype)initWithAudioUnit:(AudioUnit)unit forceGeneric:(BOOL)useGeneric {
+    NSView *view = nil;
+
+    if (useGeneric) {
+        view = [self createGenericViewForUnit:unit];
+    } else if ([ofxAudioUnitUIWindow audioUnitHasCocoaView:unit]) {
+        view = [self createCocoaViewForUnit:unit];
+        if (!view) {
+            view = [self createGenericViewForUnit:unit];
+        }
+    } else if ([ofxAudioUnitUIWindow audioUnitHasCarbonView:unit]) {
+        [self printUnsupportedCarbonMessage:unit];
+        return nil;
+    } else {
+        view = [self createGenericViewForUnit:unit];
+    }
+
+    if (!view) {
+        return nil;
+    }
+
+    self = [self initWithAudioUnitView:view];
+
+    // Add to tracking set to keep a strong reference
+    if (self) {
+        [GetOpenWindows() addObject:self];
+    }
+
+    return self;
 }
 
-// ----------------------------------------------------------
-- (instancetype) initWithCocoaViewForUnit:(AudioUnit)unit
-// ----------------------------------------------------------
-{
-	// getting the size of the AU View info
-	UInt32 dataSize;
-	Boolean isWriteable;
-	OSStatus result = AudioUnitGetPropertyInfo(unit,
-											   kAudioUnitProperty_CocoaUI,
-											   kAudioUnitScope_Global,
-											   0,
-											   &dataSize,
-											   &isWriteable);
-	
-	UInt32 numberOfClasses = (dataSize - sizeof(CFURLRef)) / sizeof(CFStringRef);
-	
-	NSView * AUView = nil;
-	
-	if((result == noErr) && (numberOfClasses > 0)) {
-		AudioUnitCocoaViewInfo * cocoaViewInfo = (AudioUnitCocoaViewInfo *)malloc(dataSize);
-		OSStatus success = AudioUnitGetProperty(unit,
-												kAudioUnitProperty_CocoaUI,
-												kAudioUnitScope_Global,
-												0,
-												cocoaViewInfo,
-												&dataSize);
-		if(success == noErr && cocoaViewInfo) {
-			CFURLRef cocoaViewBundlePath = cocoaViewInfo->mCocoaAUViewBundleLocation;
-			CFStringRef factoryClassName = cocoaViewInfo->mCocoaAUViewClass[0];
-			NSBundle * viewBundle = [NSBundle bundleWithURL:(__bridge NSURL *)cocoaViewBundlePath];
-			
-			if(viewBundle) {
-				Class factoryClass = [viewBundle classNamed:(__bridge NSString *)factoryClassName];
-				id<AUCocoaUIBase> factoryInstance = [[factoryClass alloc] init];
-				AUView = [factoryInstance uiViewForAudioUnit:unit withSize:NSZeroSize];
-			}
-		}
-		
-		free(cocoaViewInfo);
-	}
-	
-	if(AUView) {
-		return [self initWithAudioUnitCocoaView:AUView];
-	} else {
-		NSLog(@"Failed to create AU view");
-		return nil;
-	}
+- (NSView *)createGenericViewForUnit:(AudioUnit)unit {
+    AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:unit];
+    view.showsExpertParameters = YES;
+#if !__has_feature(objc_arc)
+    [view autorelease];
+#endif
+    return view;
 }
 
-// ----------------------------------------------------------
-- (instancetype) initWithGenericViewForUnit:(AudioUnit)unit
-// ----------------------------------------------------------
-{
-	AUGenericView * AUView = OF_OBJC_AUTORELEASE([[AUGenericView alloc] initWithAudioUnit:unit]);	[AUView setShowsExpertParameters:YES];
-	return [self initWithAudioUnitCocoaView:AUView];
+- (NSView *)createCocoaViewForUnit:(AudioUnit)unit {
+    UInt32 dataSize;
+    Boolean isWriteable;
+    OSStatus result = AudioUnitGetPropertyInfo(unit,
+                                               kAudioUnitProperty_CocoaUI,
+                                               kAudioUnitScope_Global,
+                                               0,
+                                               &dataSize,
+                                               &isWriteable);
+
+    if (result != noErr) {
+        return nil;
+    }
+
+    UInt32 numberOfClasses = (dataSize - sizeof(CFURLRef)) / sizeof(CFStringRef);
+    if (numberOfClasses == 0) {
+        return nil;
+    }
+
+    AudioUnitCocoaViewInfo *cocoaViewInfo = (AudioUnitCocoaViewInfo *)malloc(dataSize);
+    if (!cocoaViewInfo) {
+        return nil;
+    }
+
+    NSView *view = nil;
+    OSStatus success = AudioUnitGetProperty(unit,
+                                            kAudioUnitProperty_CocoaUI,
+                                            kAudioUnitScope_Global,
+                                            0,
+                                            cocoaViewInfo,
+                                            &dataSize);
+
+    if (success == noErr) {
+        CFURLRef bundlePath = cocoaViewInfo->mCocoaAUViewBundleLocation;
+        CFStringRef className = cocoaViewInfo->mCocoaAUViewClass[0];
+        NSBundle *bundle = [NSBundle bundleWithURL:(__bridge NSURL *)bundlePath];
+
+        if (bundle) {
+            Class factoryClass = [bundle classNamed:(__bridge NSString *)className];
+            if (factoryClass) {
+                id<AUCocoaUIBase> factory = [[factoryClass alloc] init];
+                if (factory) {
+                    view = [factory uiViewForAudioUnit:unit withSize:NSZeroSize];
+#if !__has_feature(objc_arc)
+                    [factory release];
+#endif
+                }
+            }
+        }
+    }
+
+    free(cocoaViewInfo);
+    return view;
 }
 
-// ----------------------------------------------------------
-- (instancetype) initWithAudioUnitCocoaView:(NSView *)audioUnitView
-// ----------------------------------------------------------
-{
-	_AUView = OF_OBJC_RETAIN(audioUnitView);
-	NSRect contentRect = NSMakeRect(0, 0, audioUnitView.frame.size.width, audioUnitView.frame.size.height);
-	self = [super initWithContentRect:contentRect
-							styleMask:(NSWindowStyleMaskTitled |
-									   NSWindowStyleMaskClosable |
-									   NSWindowStyleMaskMiniaturizable)
-							  backing:NSBackingStoreBuffered
-								defer:YES];
-	if(self)
-	{
-		self.level = NSNormalWindowLevel;
-		self.contentView = _AUView;
-		
-		[[NSNotificationCenter defaultCenter] addObserver:self
-												 selector:@selector(audioUnitChangedViewSize:)
-													 name:NSViewFrameDidChangeNotification
-												   object:_AUView];
-	}
-	return self;
+- (instancetype)initWithAudioUnitView:(NSView *)view {
+    NSRect contentRect = NSMakeRect(0, 0, view.frame.size.width, view.frame.size.height);
+
+    self = [super initWithContentRect:contentRect
+                            styleMask:(NSWindowStyleMaskTitled |
+                                       NSWindowStyleMaskClosable |
+                                       NSWindowStyleMaskMiniaturizable)
+                              backing:NSBackingStoreBuffered
+                                defer:NO];
+
+    if (self) {
+        self.auView = view;
+        self.contentView = view;
+        self.releasedWhenClosed = NO;  // Don't release when closed, we'll manage it
+
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(viewFrameChanged:)
+                                                     name:NSViewFrameDidChangeNotification
+                                                   object:view];
+    }
+
+    return self;
 }
 
-// ----------------------------------------------------------
-- (void) printUnsupportedCarbonMessage:(AudioUnit)unit
-// ----------------------------------------------------------
-{
-	NSString * msg = @"This audio unit only has a Carbon-based UI. Carbon\
-	support has been removed from ofxAudioUnit. Checkout the \"carbon\" tag\
-	for the last commit which has Carbon support";
-	
-	NSLog(@"%@", msg);
+- (void)viewFrameChanged:(NSNotification *)notification {
+    NSView *view = (NSView *)notification.object;
+    if (view != self.auView) return;
+
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:NSViewFrameDidChangeNotification
+                                                  object:view];
+
+    NSRect newFrame = self.frame;
+    NSSize newSize = [self frameRectForContentRect:view.frame].size;
+    newFrame.origin.y -= newSize.height - newFrame.size.height;
+    newFrame.size = newSize;
+    [self setFrame:newFrame display:YES];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(viewFrameChanged:)
+                                                 name:NSViewFrameDidChangeNotification
+                                               object:view];
 }
 
-// ----------------------------------------------------------
-+ (BOOL) audioUnitHasCocoaView:(AudioUnit)unit
-// ----------------------------------------------------------
-{
-	UInt32 dataSize;
-	UInt32 numberOfClasses;
-	Boolean isWriteable;
-	
-	OSStatus result = AudioUnitGetPropertyInfo(unit,
-											   kAudioUnitProperty_CocoaUI,
-											   kAudioUnitScope_Global,
-											   0,
-											   &dataSize,
-											   &isWriteable);
-	
-	numberOfClasses = (dataSize - sizeof(CFURLRef)) / sizeof(CFStringRef);
-	
-	return (result == noErr) && (numberOfClasses > 0);
+- (void)printUnsupportedCarbonMessage:(AudioUnit)unit {
+    NSLog(@"This audio unit only has a Carbon-based UI. Carbon support has been removed from ofxAudioUnit.");
 }
 
-// ----------------------------------------------------------
-+ (BOOL) audioUnitHasCarbonView:(AudioUnit)unit
-// ----------------------------------------------------------
-{
-	UInt32 dataSize;
-	Boolean isWriteable;
-	OSStatus s = AudioUnitGetPropertyInfo(unit,
-										  kAudioUnitProperty_GetUIComponentList,
-										  kAudioUnitScope_Global,
-										  0,
-										  &dataSize,
-										  &isWriteable);
-	
-	return (s == noErr) && (dataSize >= sizeof(ComponentDescription));
++ (BOOL)audioUnitHasCocoaView:(AudioUnit)unit {
+    UInt32 dataSize;
+    Boolean isWriteable;
+    OSStatus result = AudioUnitGetPropertyInfo(unit,
+                                               kAudioUnitProperty_CocoaUI,
+                                               kAudioUnitScope_Global,
+                                               0,
+                                               &dataSize,
+                                               &isWriteable);
+
+    if (result != noErr) return NO;
+
+    UInt32 numberOfClasses = (dataSize - sizeof(CFURLRef)) / sizeof(CFStringRef);
+    return numberOfClasses > 0;
 }
 
-// ----------------------------------------------------------
-- (void) audioUnitChangedViewSize:(NSNotification *)notification
-// ----------------------------------------------------------
-{
-	[[NSNotificationCenter defaultCenter] removeObserver:self
-													name:NSViewFrameDidChangeNotification
-												  object:_AUView];
-	
-	NSRect newRect = self.frame;
-	NSSize newSize = [self frameRectForContentRect:((NSView *)[notification object]).frame].size;
-	newRect.origin.y -= newSize.height - newRect.size.height;
-	newRect.size = newSize;
-	[self setFrame:newRect display:YES];
-	
-	[[NSNotificationCenter defaultCenter] addObserver:self
-											 selector:@selector(audioUnitChangedViewSize:)
-												 name:NSViewFrameDidChangeNotification
-											   object:_AUView];
++ (BOOL)audioUnitHasCarbonView:(AudioUnit)unit {
+    UInt32 dataSize;
+    Boolean isWriteable;
+    OSStatus result = AudioUnitGetPropertyInfo(unit,
+                                               kAudioUnitProperty_GetUIComponentList,
+                                               kAudioUnitScope_Global,
+                                               0,
+                                               &dataSize,
+                                               &isWriteable);
+
+    return (result == noErr) && (dataSize >= sizeof(ComponentDescription));
 }
 
 @end
@@ -215,32 +224,30 @@
 
 using namespace std;
 
-// ----------------------------------------------------------
-void ofxAudioUnit::showUI(const string &title, int x, int y, bool forceGeneric)
-// ----------------------------------------------------------
-{
-	if(!_unit.get()) return;
-	
-	NSString * windowTitle = [[NSString stringWithUTF8String:title.c_str()] copy];
-	
-	if(!windowTitle) {
-		windowTitle = @"Audio Unit UI";
-	}
-	
-	AudioUnitRef au = _unit;
-	
-	dispatch_async(dispatch_get_main_queue(), ^{
-		if(!au) return;
-		
-		ofxAudioUnitUIWindow * auWindow = [[ofxAudioUnitUIWindow alloc] initWithAudioUnit:*au forceGeneric:forceGeneric];
-		
-		if(auWindow) {
-			CGFloat flippedY = [[NSScreen mainScreen] visibleFrame].size.height - y - auWindow.frame.size.height;
-			[auWindow setFrameOrigin:NSMakePoint(x, flippedY)];
-			[auWindow setTitle:windowTitle];
-			[auWindow makeKeyAndOrderFront:nil];
-		}
-	});
+void ofxAudioUnit::showUI(const string &title, int x, int y, bool forceGeneric) {
+    if (!_unit.get()) return;
+
+    AudioUnitRef auRef = _unit;
+    string titleCopy = title;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!auRef) return;
+
+        ofxAudioUnitUIWindow *window = [[ofxAudioUnitUIWindow alloc] initWithAudioUnit:*auRef
+                                                                          forceGeneric:forceGeneric];
+        if (!window) return;
+
+        CGFloat flippedY = [[NSScreen mainScreen] visibleFrame].size.height - y - window.frame.size.height;
+        [window setFrameOrigin:NSMakePoint(x, flippedY)];
+
+        NSString *windowTitle = [NSString stringWithUTF8String:titleCopy.c_str()];
+        [window setTitle:windowTitle ?: @"Audio Unit UI"];
+        [window makeKeyAndOrderFront:nil];
+
+#if !__has_feature(objc_arc)
+        [window release];
+#endif
+    });
 }
 
 #endif //TARGET_OS_IPHONE
