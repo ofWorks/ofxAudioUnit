@@ -2,6 +2,7 @@
 #include "ofxAudioUnitUtils.h"
 #include "ofUtils.h"
 #include "ofTypes.h"
+#include "ofFileUtils.h"
 #include <iostream>
 
 using namespace std;
